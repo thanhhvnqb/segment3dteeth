@@ -12,8 +12,12 @@ import gradio as gr
 
 from .contracts import LABEL_TO_NAME, POSTPROCESS_LABEL_IDS
 from .io import case_to_nnunet_inputs, load_volume
-from .mesh import export_filtered_preview, export_preview_and_bundle
+from .mesh import (
+    export_filtered_preview,
+    export_preview_and_bundle,
+)
 from .postprocess import remove_small_islands
+from .tooth_segmentation import segment_teeth
 from .triton_client import TritonConnection, TritonSegmentationClient
 
 CSS = """
@@ -64,10 +68,11 @@ def _default_cache_root() -> Path:
 CACHE_ROOT = _default_cache_root()
 INPUT_CACHE_DIR = CACHE_ROOT / "input"
 OUTPUT_CACHE_DIR = CACHE_ROOT / "output"
+PIPELINE_VERSION = "4-tooth-transparency-for-jaw-bones"
+DEFAULT_VISIBLE_PARTS = [f"label:{label_id}" for label_id in POSTPROCESS_LABEL_IDS]
 VISIBLE_PART_CHOICES = [
-    (LABEL_TO_NAME[label_id], str(label_id)) for label_id in POSTPROCESS_LABEL_IDS
+    (LABEL_TO_NAME[label_id], f"label:{label_id}") for label_id in POSTPROCESS_LABEL_IDS
 ]
-DEFAULT_VISIBLE_PARTS = [str(label_id) for label_id in POSTPROCESS_LABEL_IDS]
 
 
 def _ensure_cache_dirs() -> None:
@@ -85,20 +90,30 @@ def _hash_file(file_path: str | Path) -> str:
 
 def _ensure_unique_cached_name(target_name: str, source_path: Path) -> Path:
     candidate = INPUT_CACHE_DIR / target_name
+    source_hash = _hash_file(source_path)
     if not candidate.exists():
         return candidate
 
-    if _hash_file(candidate) == _hash_file(source_path):
+    if _hash_file(candidate) == source_hash:
         return candidate
 
     stem = Path(target_name).stem
     suffix = Path(target_name).suffix or ".zip"
-    source_hash = _hash_file(source_path)[:8]
-    return INPUT_CACHE_DIR / f"{stem}_{source_hash}{suffix}"
+    index = 1
+    while True:
+        suffixed_candidate = INPUT_CACHE_DIR / f"{stem}_{index}{suffix}"
+        if not suffixed_candidate.exists():
+            return suffixed_candidate
+        if _hash_file(suffixed_candidate) == source_hash:
+            return suffixed_candidate
+        index += 1
 
 
 def _cache_uploaded_zip(zip_path: str | Path) -> Path:
     source = Path(zip_path)
+    if source.parent.resolve() == INPUT_CACHE_DIR.resolve() and source.exists():
+        return source
+
     target_name = (
         source.name if source.suffix.lower() == ".zip" else f"{source.name}.zip"
     )
@@ -109,17 +124,19 @@ def _cache_uploaded_zip(zip_path: str | Path) -> Path:
     return cached_zip
 
 
-def _output_paths(cached_zip: Path) -> tuple[Path, Path, Path]:
-    output_dir = OUTPUT_CACHE_DIR / cached_zip.stem
-    preview_path = output_dir / f"{cached_zip.stem}.glb"
+def _output_paths(cached_zip: Path) -> tuple[Path, Path, Path, Path, str]:
+    input_hash = _hash_file(cached_zip)
+    output_dir = OUTPUT_CACHE_DIR / input_hash
+    preview_path = output_dir / f"{input_hash}.glb"
     hash_marker_path = output_dir / "input.sha256"
-    return output_dir, preview_path, hash_marker_path
+    version_marker_path = output_dir / "pipeline.version"
+    return output_dir, preview_path, hash_marker_path, version_marker_path, input_hash
 
 
-def _filtered_preview_path(output_dir: Path, visible_label_ids: list[int]) -> Path:
+def _filtered_preview_path(output_dir: Path, visible_label_ids: list[str]) -> Path:
     if not visible_label_ids:
         return output_dir / "preview_none.glb"
-    key = "-".join(str(label_id) for label_id in sorted(set(visible_label_ids)))
+    key = "-".join(value.replace(":", "_") for value in sorted(set(visible_label_ids)))
     return output_dir / f"preview_labels_{key}.glb"
 
 
@@ -173,13 +190,24 @@ def _load_and_predict(
 ) -> tuple[str, str]:
     _ensure_cache_dirs()
     cached_zip = _cache_uploaded_zip(zip_path)
-    output_dir, preview_path, hash_marker_path = _output_paths(cached_zip)
+    (
+        output_dir,
+        preview_path,
+        hash_marker_path,
+        version_marker_path,
+        input_hash,
+    ) = _output_paths(cached_zip)
 
     current_hash: str | None = None
-    if preview_path.exists() and hash_marker_path.exists():
-        current_hash = _hash_file(cached_zip)
+    if (
+        preview_path.exists()
+        and hash_marker_path.exists()
+        and version_marker_path.exists()
+    ):
+        current_hash = input_hash
         stored_hash = hash_marker_path.read_text().strip()
-        if stored_hash == current_hash:
+        stored_version = version_marker_path.read_text().strip()
+        if stored_hash == current_hash and stored_version == PIPELINE_VERSION:
             return str(preview_path), cached_zip.name
 
     if client is None:
@@ -195,9 +223,18 @@ def _load_and_predict(
     segmentation = client.infer(image, tuple(payload["spacing"]))
     segmentation = segmentation.astype("uint8", copy=False)
     segmentation = remove_small_islands(segmentation, case.spacing)
+    tooth_result = segment_teeth(segmentation, case.spacing)
+
+    for warning in tooth_result.warnings:
+        print(f"[tooth-segmentation] {warning}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    mesh_outputs = export_preview_and_bundle(segmentation, case.spacing, output_dir)
+    mesh_outputs = export_preview_and_bundle(
+        segmentation,
+        case.spacing,
+        output_dir,
+        tooth_masks=tooth_result.tooth_masks,
+    )
     generated_preview = mesh_outputs.get("gltf")
     if generated_preview is None:
         raise RuntimeError("Failed to generate 3D preview")
@@ -205,39 +242,45 @@ def _load_and_predict(
         Path(generated_preview).replace(preview_path)
 
     if current_hash is None:
-        current_hash = _hash_file(cached_zip)
+        current_hash = input_hash
     hash_marker_path.write_text(current_hash)
+    version_marker_path.write_text(PIPELINE_VERSION)
 
     return str(preview_path), cached_zip.name
 
 
 def _build_preview_for_visible_parts(
-    cached_zip_name: str | None, visible_parts: list[str] | None
+    cached_zip_name: str | None,
+    visible_parts: list[str] | None,
 ) -> str:
     if not cached_zip_name:
         raise gr.Error("Run segmentation first before toggling visible parts.")
 
-    output_dir = OUTPUT_CACHE_DIR / Path(cached_zip_name).stem
-    base_preview_path = output_dir / f"{Path(cached_zip_name).stem}.glb"
+    cached_zip_path = INPUT_CACHE_DIR / cached_zip_name
+    if not cached_zip_path.exists():
+        raise gr.Error("Cached input file is missing. Please re-upload and run again.")
+
+    input_hash = _hash_file(cached_zip_path)
+    output_dir = OUTPUT_CACHE_DIR / input_hash
+    base_preview_path = output_dir / f"{input_hash}.glb"
     if not base_preview_path.exists():
         raise gr.Error("Preview file is missing. Please run segmentation again.")
 
     visible_parts = visible_parts or []
-    visible_label_ids = [int(value) for value in visible_parts]
-    if not visible_label_ids:
+    if not visible_parts:
         raise gr.Error("Select at least one part to display.")
 
-    if set(visible_label_ids) == set(POSTPROCESS_LABEL_IDS):
+    if set(visible_parts) == set(DEFAULT_VISIBLE_PARTS):
         return str(base_preview_path)
 
-    filtered_preview_path = _filtered_preview_path(output_dir, visible_label_ids)
+    filtered_preview_path = _filtered_preview_path(output_dir, visible_parts)
     if filtered_preview_path.exists():
         return str(filtered_preview_path)
 
     generated_path = export_filtered_preview(
         source_preview_path=base_preview_path,
         output_preview_path=filtered_preview_path,
-        visible_label_ids=visible_label_ids,
+        visible_label_ids=visible_parts,
     )
     return str(generated_path)
 
@@ -275,8 +318,8 @@ def build_demo() -> gr.Blocks:
               <h1 style="margin:0 0 8px 0;">Dental Segmentator</h1>
               <p style="margin:0; max-width: 70ch;">
                 Upload one zip file containing DICOM files or choose a zip already available
-                in cache/input. Uploaded files are stored by filename, and hash is computed
-                only when needed to validate whether an existing 3D result can be reused.
+                                in cache/input. Input files keep original names (with _1, _2 suffixes on
+                                collisions), while output cache is keyed by input SHA256 for reliable reuse.
               </p>
             </div>
             """)
@@ -330,17 +373,21 @@ def build_demo() -> gr.Blocks:
                 else (choices[0] if choices else None)
             )
             preview = _build_preview_for_visible_parts(
-                cached_name, DEFAULT_VISIBLE_PARTS
+                cached_name,
+                DEFAULT_VISIBLE_PARTS,
             )
             return (
                 preview,
                 gr.update(choices=choices, value=selected),
                 cached_name,
-                gr.update(value=DEFAULT_VISIBLE_PARTS),
+                gr.update(choices=VISIBLE_PART_CHOICES, value=DEFAULT_VISIBLE_PARTS),
             )
 
         def _update_preview_visibility(visible_parts, cached_zip_name):
-            return _build_preview_for_visible_parts(cached_zip_name, visible_parts)
+            return _build_preview_for_visible_parts(
+                cached_zip_name,
+                visible_parts,
+            )
 
         source_mode.change(
             _toggle_input_source,

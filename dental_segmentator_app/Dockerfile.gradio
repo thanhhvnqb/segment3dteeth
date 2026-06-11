@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt /workspace/requirements.txt
 
-RUN python -m pip install --no-cache-dir -r /workspace/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+        pip install -r /workspace/requirements.txt
 
 COPY . /workspace/dental_segmentator_app
 
