@@ -1,0 +1,3 @@
+**/*.pyc
+**/*.pth
+dental_segmentation_cache

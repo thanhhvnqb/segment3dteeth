@@ -1,0 +1,28 @@
+services:
+  triton:
+    build:
+      context: ./triton_server
+      dockerfile: Dockerfile.triton
+    shm_size: "1gb"
+    gpus: all
+    environment:
+      DENTAL_SEGMENTATOR_MODEL_PATH: /model_weight/DentalSegmentator_v100
+    volumes:
+      - ./triton_server/models:/models
+      - ./triton_server/model_weight:/model_weight
+
+  gradio:
+    build:
+      context: ./dental_segmentator_app
+      dockerfile: Dockerfile.gradio
+    depends_on:
+      - triton
+    ports:
+      - "7860:7860"
+    environment:
+      TRITON_URL: triton:8001
+      HOT_RELOAD: "1"
+    volumes:
+      - ./exports:/exports
+      - ./dental_segmentator_app:/workspace/dental_segmentator_app
+      - ./dental_segmentation_cache:/dental_segmentation_cache
