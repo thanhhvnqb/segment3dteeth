@@ -12,8 +12,9 @@ from skimage.measure import marching_cubes
 from .contracts import LABEL_TO_COLOR_HEX, POSTPROCESS_LABEL_IDS
 
 TRANSPARENT_LABEL_ALPHA = {
-    1: 72,
-    2: 72,
+    # ~60% transparent (40% opacity) to keep root structures visible.
+    1: 102,
+    2: 102,
 }
 
 
@@ -73,6 +74,29 @@ def _label_color_rgba(label_id: int) -> tuple[int, int, int, int]:
     return red, green, blue, alpha
 
 
+def _apply_label_visual(mesh: trimesh.Trimesh, rgba: tuple[int, int, int, int]) -> None:
+    """Apply color/material to a mesh.
+
+    For transparent labels we use a PBRMaterial with alphaMode='BLEND' so that
+    GLTF viewers (Three.js / Gradio) actually honour the alpha channel.  Plain
+    vertex-color alpha is silently ignored by most renderers because trimesh
+    exports with alphaMode='OPAQUE' by default.
+    """
+    r, g, b, a = rgba
+    if a < 255:
+        material = trimesh.visual.material.PBRMaterial(
+            baseColorFactor=[r / 255.0, g / 255.0, b / 255.0, a / 255.0],
+            alphaMode="BLEND",
+            doubleSided=True,
+        )
+        mesh.visual = trimesh.visual.TextureVisuals(material=material)
+    else:
+        mesh.visual.vertex_colors = np.tile(
+            np.array(rgba, dtype=np.uint8),
+            (len(mesh.vertices), 1),
+        )
+
+
 def _tooth_color_rgba(tooth_id: int) -> tuple[int, int, int, int]:
     # Deterministic hue spread so each tooth keeps a stable distinct color.
     hue = (tooth_id * 0.61803398875) % 1.0
@@ -109,10 +133,7 @@ def build_scene_from_segmentation(
         mesh = _mask_to_mesh(segmentation == label_id, spacing_zyx)
         if mesh is None:
             continue
-        mesh.visual.vertex_colors = np.tile(
-            np.array(_label_color_rgba(label_id), dtype=np.uint8),
-            (len(mesh.vertices), 1),
-        )
+        _apply_label_visual(mesh, _label_color_rgba(label_id))
         scene.add_geometry(mesh, node_name=f"label_{label_id}")
 
     for tooth_id, tooth_mask in sorted((tooth_masks or {}).items()):

@@ -68,7 +68,7 @@ def _default_cache_root() -> Path:
 CACHE_ROOT = _default_cache_root()
 INPUT_CACHE_DIR = CACHE_ROOT / "input"
 OUTPUT_CACHE_DIR = CACHE_ROOT / "output"
-PIPELINE_VERSION = "4-tooth-transparency-for-jaw-bones"
+PIPELINE_VERSION = "6-jaw-bones-pbr-blend-transparent"
 DEFAULT_VISIBLE_PARTS = [f"label:{label_id}" for label_id in POSTPROCESS_LABEL_IDS]
 VISIBLE_PART_CHOICES = [
     (LABEL_TO_NAME[label_id], f"label:{label_id}") for label_id in POSTPROCESS_LABEL_IDS
